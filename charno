@@ -1,0 +1,127 @@
+#!/usr/bin/perl
+
+# Filter text/html; charset=... to text/html for older clients that don't
+# get it.
+#
+# (C)2023 Cameron Kaiser. All rights reserved.
+# Floodgap Free Software License.
+# https://oldvcr.blogspot.com/
+
+# Point at a compatible proxy server, such as Crypto Ancienne's carl -p.
+if (length($ARGV[0]) && length($ARGV[1])) {
+	$proxyhost = $ARGV[0];
+	$proxyport = 0+$ARGV[1];
+} else {
+	$proxyhost = "localhost";
+	$proxyport = 8765;
+}
+
+########################################################################
+
+$SIG{'__DIE__'} = sub { &hterror("death permeates me: $! $@"); };
+$AF_INET = 2;
+$SOCK_STREAM = 1;
+($x,$x,$IPPROTO_TCP) = getprotobyname("tcp");
+$sockaddr = 'S n a4 x8';
+
+# not every system might have Socket.pm
+if (eval("use Socket; 99") == 99) {
+	# not every Socket.pm might define these
+	eval '$AF_INET = AF_INET if (0+AF_INET)';
+	eval '$SOCK_STREAM = SOCK_STREAM if (0+SOCK_STREAM)';
+	eval '$IPPROTO_TCP = IPPROTO_TCP if (0+IPPROTO_TCP)';
+}
+select(STDOUT); $|++;
+$SIG{'ALRM'} = sub { &error("timeout resolving host"); };
+alarm 10;
+($name, $aliases, $type, $len, $thataddr) = gethostbyname($proxyhost);
+&hterror("can't resolve host") if (!$name);
+&hterror("only IPv4 supported") if ($len != 4);
+
+$buf = '';
+$rin = '';
+$win = '';
+$buff = '';
+$rout = '';
+$wout = '';
+$method = '';
+$clength = 0;
+
+#
+# read the request (all blocking i/o)
+#
+
+alarm 30;
+$SIG{'ALRM'} = sub { &hterror("timeout receiving request"); };
+while(<STDIN>) {
+	$buf .= $_;
+	(($buf =~ /^([A-Za-z]+)\s/) && ($method = uc($1)))
+		unless length $method;
+	(/^Content-length:\s+(\d+)/i) && ($clength = $1);
+
+	last if (/^[\r\l\n\s]+$/);
+}
+if ($method eq 'POST') { # I doubt browsers of this era supported PUT
+	read(STDIN, $buff, $clength);
+	$buf .= $buff;
+}
+
+#
+# push forward the request to the proxy
+#
+
+alarm 10;
+$SIG{'ALRM'} = sub { &hterror("timeout connecting to host"); };
+$that = pack($sockaddr, 2, $proxyport, $thataddr, 0);
+socket(S, $AF_INET, $SOCK_STREAM, $IPPROTO_TCP) || &hterror("socket: $!");
+connect(S, $that) || &hterror("connect: $!");
+select(S); $|++;
+print S $buf; # blocks
+
+#
+# read and alter (if needed) headers from the proxy
+#
+
+$buf = '';
+alarm 10;
+$SIG{'ALRM'} = sub { &hterror("timeout receiving headers from host"); };
+while(<S>) {
+	(/^Content-type:\s+text\/html;/i) &&
+		($_ = "Content-type: text/html\r\n");
+
+	$buf .= $_;
+	last if (/^[\r\l\n\s]+$/);
+}
+print STDOUT $buf; # blocks
+
+#
+# emit all trailing data from the proxy and terminate
+#
+
+alarm 0; # switch to select()
+vec($rin, fileno(S), 1) = 1;
+vec($win, fileno(STDOUT), 1) = 1; # WHIP INFLATION NOW!
+
+for(;;) {
+	&hterror("timeout on read")
+		if (select($rout = $rin, undef, undef, 10) < 1);
+
+	read(S, $buf, 4096);
+	# if socket is ready but there is no data, treat as EOF
+	last if (!length($buf));
+
+	&hterror("timeout on write")
+		if (select(undef, $wout = $win, undef, 10) < 1);
+	print STDOUT $buf;
+}
+close(S);
+close(STDOUT);
+exit;
+
+sub hterror {
+	print STDOUT "HTTP/1.0 500 Server Error\r\n";
+	print STDOUT "Connection: close\r\n";
+	print STDOUT "Content-type: text/html\r\n\r\n";
+	print STDOUT "@_";
+	exit;
+}
